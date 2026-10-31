@@ -1,0 +1,138 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Feeling of Knowing in Large Language Models</title>
+  <meta name="description" content="Feeling of Knowing in Large Language Models. NeurIPS 2026. Aligning LLMs' answerability judgments with updated knowledge through OP-SFT, KΔ-FT and FGPO.">
+  <link href="https://fonts.googleapis.com/css2?family=Noto+Sans:wght@400;500;600;700&family=Castoro&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.2/css/all.min.css">
+  <link rel="stylesheet" href="static/css/index.css">
+</head>
+<body>
+
+<section class="hero">
+  <h1 class="pub-title"><img src="static/images/title.png" alt="Know-thyself: Feeling of Knowing in Large Language Models"></h1>
+  <p class="venue">NeurIPS 2026</p>
+
+  <p class="authors">
+    <span>Zichuan Fu<sup>1</sup></span>
+    <span>Xian Wu<sup>2</sup></span>
+    <span>Jingtong Gao<sup>1</sup></span>
+    <span>Wenlin Zhang<sup>1</sup></span>
+    <span>Jiaxuan Li<sup>1</sup></span>
+    <span>Binhao Wang<sup>1</sup></span>
+    <span>Yimin Deng<sup>1,3</sup></span>
+    <span>Guojing Li<sup>1,4</sup></span>
+    <span>Xiaopeng Li<sup>1</sup></span>
+    <span>Derong Xu<sup>1,5</sup></span>
+    <span>Yefeng Zheng<sup>6</sup></span>
+    <span>Xiangyu Zhao<sup>1</sup></span>
+  </p>
+  <p class="affils"><sup>1</sup>City University of Hong Kong &nbsp;&nbsp; <sup>2</sup>Tencent Jarvis Lab &nbsp;&nbsp; <sup>3</sup>Xi'an Jiaotong University<br><sup>4</sup>Renmin University of China &nbsp;&nbsp; <sup>5</sup>University of Science and Technology of China &nbsp;&nbsp; <sup>6</sup>Westlake University</p>
+
+  <div class="buttons">
+    <a class="btn disabled" title="Coming soon"><i class="fas fa-file-pdf"></i> Paper (coming soon)</a>
+    <a class="btn" href="https://github.com/fzkuji2026/Know-thyself"><i class="fab fa-github"></i> Code</a>
+  </div>
+</section>
+
+<section class="section">
+  <div class="two-col">
+    <figure><img src="static/images/f1_main_tp_single.png" alt="Causal tracing of the FoK signal in a 7B LLM"><figcaption>(a) Causal tracing of the FoK signal in a 7B LLM</figcaption></figure>
+    <figure><img src="static/images/f1_main_recovery_baseline.png" alt="FoK signal across normalized depth for Qwen2.5 sizes"><figcaption>(b) FoK signal across normalized depth</figcaption></figure>
+  </div>
+  <p class="caption"><b>Figure 1.</b> The FoK signal localizes late under causal restoration. Panel (a) shows a 7B example across tokens and layers; panel (b) aggregates FoK recovery across Qwen2.5 sizes over normalized depth.</p>
+</section>
+
+<section class="section">
+  <h2>Abstract</h2>
+  <p class="justify">Post-training updates change what large language models (LLMs) can answer, but may leave their answerability judgments misaligned. We study this knowledge&ndash;judgment desynchronization through functional <i>feeling of knowing</i> (FoK), which supports selective generation, retrieval triggering, and model routing without implying subjective experience. We propose two trainable channels: a knowledge channel that changes answerability and a FoK channel that judges the current knowledge state. Three stages train them: on-policy supervised fine-tuning (OP-SFT) updates knowledge from corrected on-policy answers; knowledge-delta FoK training (K&Delta;-FT) adapts judgments across intermediate knowledge states; and FoK-guided policy optimization (FGPO) trains the subsequent answer or explanation. Factual-QA experiments, cross-dataset evaluation, and three sequential updates show that explicit FoK alignment improves judgment quality on updated knowledge. MMLU and ARC-Easy separately assess capability preservation.</p>
+</section>
+
+<section class="section">
+  <h2>Key Takeaways</h2>
+  <ul class="takeaways">
+    <li>🧠 <b>FoK sits late in the network.</b> Under causal tracing, the FoK signal peaks later in model depth than factual associations, so FoK acts as a judgment over the model's knowledge state rather than as factual recall itself.</li>
+    <li>🔀 <b>Knowledge updates do not update FoK.</b> Fine-tuning changes what the model can answer, but its judgment of whether it can answer does not follow. Unless FoK is updated explicitly, the mapping from knowledge to self-judgment breaks.</li>
+    <li>💭 <b>Context sharpens the judgment.</b> Reasoning before the judgment moves the FoK score away from uncertainty, so FoK should be judged from the model's current context, not from the question alone.</li>
+    <li>🛠️ <b>Three stages re-synchronize the two channels.</b> OP-SFT updates knowledge, K&Delta;-FT trains FoK over the knowledge trajectory, and FGPO lets the model answer or explain what it is missing within one generation.</li>
+  </ul>
+</section>
+
+<section class="section">
+  <h2>Method</h2>
+  <p class="justify">Starting from a base LLM <i>M</i>, we represent post-training changes as parameter deltas. The knowledge delta <i>&kappa;</i> forms the knowledge-retrieval channel, which changes what the model knows. The FoK delta <i>&phi;</i> forms the FoK channel, which judges whether the current knowledge state supports a correct answer. The FoK score is read from the model's yes/no judgment:</p>
+  <p class="eq"><i>J</i> = <i>P</i>(yes) / (<i>P</i>(yes) + <i>P</i>(no))</p>
+  <div class="ops">
+    <div class="op"><b>Stage 1 &middot; OP-SFT</b><span>Updates <i>&kappa;</i> on the model's own sampled responses, supervising only the corrected answer span, and saves the trajectory of knowledge states <i>&kappa;</i><sub>0</sub>, &hellip;, <i>&kappa;</i><sub>T</sub>.</span></div>
+    <div class="op"><b>Stage 2 &middot; K&Delta;-FT</b><span>Trains <i>&phi;</i> over the OP-SFT checkpoint trajectory, so FoK follows the knowledge as it evolves instead of staying tied to a fixed knowledge boundary.</span></div>
+    <div class="op"><b>Stage 3 &middot; FGPO</b><span>Trains the model to reason, judge yes or no, and then answer or explain why it cannot, with one reward over the judgment and the response.</span></div>
+  </div>
+  <p class="justify">FGPO generates a short context trace, makes a FoK judgment, and produces an answer or explanation in one pass:</p>
+  <pre><code>&lt;think&gt;...reasoning...&lt;/think&gt; &lt;answer&gt;yes|no&lt;/answer&gt;
+&lt;response&gt;answer or explanation&lt;/response&gt;</code></pre>
+</section>
+
+<section class="section">
+  <h2>Results</h2>
+  <p class="justify">We update Qwen2.5-7B-Instruct with TriviaQA questions and evaluate on the update set (Train), held-out TriviaQA questions (Test), and MMLU and ARC-Easy (General). Bias is the signed mean of illusion and omission errors; closer to 0 is better.</p>
+  <div class="table-wrap">
+    <table>
+      <caption><b>Table 1.</b> Overall performance after one TriviaQA knowledge update on Qwen2.5-7B (selected rows; the paper reports all baselines).</caption>
+      <thead><tr><th>Method</th><th>Train Acc. &uarr;</th><th>Train AUROC &uarr;</th><th>Test Acc. &uarr;</th><th>Test AUROC &uarr;</th><th>Test Bias &rarr;0</th><th>MMLU &uarr;</th><th>ARC &uarr;</th></tr></thead>
+      <tbody>
+        <tr><td>Base</td><td>0.680</td><td>0.702</td><td>0.672</td><td>0.688</td><td>0.402</td><td>0.687</td><td>0.811</td></tr>
+        <tr><td>Base + EliCal</td><td>0.637</td><td>0.808</td><td>0.622</td><td><b>0.810</b></td><td><b>0.254</b></td><td>0.709</td><td>0.504</td></tr>
+        <tr class="sep"><td>Vanilla K-SFT</td><td>0.874</td><td>0.458</td><td>0.546</td><td>0.519</td><td>0.500</td><td>0.713</td><td><b>0.840</b></td></tr>
+        <tr><td>Vanilla K-SFT + Prob</td><td>0.874</td><td>0.590</td><td>0.546</td><td>0.541</td><td>0.498</td><td>0.713</td><td>0.840</td></tr>
+        <tr><td>Vanilla K-SFT + SemEnt</td><td>0.874</td><td>0.538</td><td>0.546</td><td>0.526</td><td>0.504</td><td>0.713</td><td>0.840</td></tr>
+        <tr class="sep ours"><td>Ours</td><td><b>0.961</b></td><td><b>0.817</b></td><td><b>0.692</b></td><td>0.809</td><td>0.308</td><td>0.711</td><td>0.830</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h3>Stage-wise ablation</h3>
+  <div class="table-wrap">
+    <table>
+      <caption><b>Table 2.</b> Held-out stage-wise ablation on Qwen2.5-7B.</caption>
+      <thead><tr><th>Stage</th><th>Acc. &uarr;</th><th>AUROC &uarr;</th><th>Illu. &darr;</th><th>Om. &darr;</th><th>Bias &rarr;0</th></tr></thead>
+      <tbody>
+        <tr><td>Base</td><td>0.672</td><td>0.688</td><td>0.683</td><td>0.122</td><td>0.402</td></tr>
+        <tr><td>Stage 1: + OP-SFT</td><td>0.679</td><td>0.603</td><td>0.601</td><td>0.283</td><td>0.442</td></tr>
+        <tr><td>Stage 2: + K&Delta;-FT</td><td>0.699</td><td>0.770</td><td>0.478</td><td>0.187</td><td>0.333</td></tr>
+        <tr class="ours"><td>Stage 3: + FGPO</td><td>0.692</td><td>0.809</td><td>0.432</td><td>0.184</td><td>0.308</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h3>Where the remaining error comes from</h3>
+  <figure>
+    <img src="static/images/fok_error_decomposition.png" alt="Illusion and omission rates for each method">
+    <figcaption><b>Figure 2.</b> FoK error decomposition for Table 1. Red circles show illusion, the conditional rate of false &ldquo;can answer&rdquo; judgments; blue squares show omission, the conditional rate of false &ldquo;cannot answer&rdquo; judgments. The horizontal gap shows which error source determines the signed Bias value.</figcaption>
+  </figure>
+
+  <h3>Coverage&ndash;accuracy trade-off</h3>
+  <figure>
+    <img src="static/images/qwen3_8b_selective_kj_grpo.png" alt="Coverage and accuracy as the FoK threshold varies on Qwen3-8B">
+    <figcaption><b>Figure 3.</b> Coverage&ndash;accuracy trade-off on Qwen3-8B (thinking mode). Each panel varies the FoK threshold and plots coverage (solid), conditional accuracy on the answered subset (dashed), and overall accuracy with unanswered examples counted as incorrect (dotted).</figcaption>
+  </figure>
+  <p class="justify">For Base and Vanilla K-SFT the curves are nearly flat: lowering coverage does not raise accuracy, so their FoK scores do not rank answerability. OP-SFT + K&Delta;-FT restores a monotonic trade-off. FGPO flattens the curves for a different reason: its scores collapse to 0 or 1, so the policy has already committed to answer or abstain, and it answers more selectively, with higher accuracy on the answered subset at the cost of lower coverage.</p>
+</section>
+
+<section class="section">
+  <h2>BibTeX</h2>
+  <pre><code>@inproceedings{fu2026feeling,
+  title     = {Feeling of Knowing in Large Language Models},
+  author    = {Fu, Zichuan and Wu, Xian and Gao, Jingtong and Zhang, Wenlin and Li, Jiaxuan and Wang, Binhao and Deng, Yimin and Li, Guojing and Li, Xiaopeng and Xu, Derong and Zheng, Yefeng and Zhao, Xiangyu},
+  booktitle = {Advances in Neural Information Processing Systems (NeurIPS)},
+  year      = {2026}
+}</code></pre>
+</section>
+
+<footer>
+  <p>Page layout inspired by the <a href="https://github.com/nerfies/nerfies.github.io">Nerfies</a> project page template.</p>
+</footer>
+
+</body>
+</html>
