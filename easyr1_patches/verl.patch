@@ -1,0 +1,232 @@
+diff --git a/verl/trainer/main.py b/verl/trainer/main.py
+index 045180e..d33b6f3 100644
+--- a/verl/trainer/main.py
++++ b/verl/trainer/main.py
+@@ -65,7 +65,11 @@ class Runner:
+         }
+         resource_pool_manager = ResourcePoolManager(resource_pool_spec=resource_pool_spec, mapping=mapping)
+ 
+-        RemoteRewardManager = ray.remote(AutoRewardManager).options(num_cpus=config.worker.reward.num_cpus)
++        reward_options = {"num_cpus": config.worker.reward.num_cpus}
++        num_reward_gpus = getattr(config.worker.reward, "num_gpus", 0)
++        if num_reward_gpus > 0:
++            reward_options["num_gpus"] = num_reward_gpus
++        RemoteRewardManager = ray.remote(AutoRewardManager).options(**reward_options)
+         reward_fn = RemoteRewardManager.remote(config.worker.reward, tokenizer)
+         val_reward_fn = RemoteRewardManager.remote(config.worker.reward, tokenizer)
+ 
+diff --git a/verl/workers/actor/dp_actor.py b/verl/workers/actor/dp_actor.py
+index e5fb886..ba7881d 100644
+--- a/verl/workers/actor/dp_actor.py
++++ b/verl/workers/actor/dp_actor.py
+@@ -39,7 +39,29 @@ from .config import ActorConfig
+ try:
+     from flash_attn.bert_padding import index_first_axis, pad_input, rearrange, unpad_input
+ except ImportError:
+-    pass
++    def unpad_input(hidden_states, attention_mask):
++        seqlens = attention_mask.sum(dim=-1, dtype=torch.int32)
++        indices = torch.nonzero(attention_mask.flatten(), as_tuple=False).flatten()
++        cu_seqlens = torch.cat([seqlens.new_zeros(1), seqlens.cumsum(0)], dim=0).to(torch.int32)
++        max_seqlen = int(seqlens.max().item())
++        hidden_states = hidden_states.view(-1, *hidden_states.shape[2:])[indices]
++        return hidden_states, indices, cu_seqlens, max_seqlen
++
++    def pad_input(hidden_states, indices, batch, seqlen):
++        output = hidden_states.new_zeros(batch * seqlen, *hidden_states.shape[1:])
++        output[indices] = hidden_states
++        return output.view(batch, seqlen, *hidden_states.shape[1:])
++
++    def index_first_axis(x, indices):
++        return x.view(-1, *x.shape[2:])[indices]
++
++    def rearrange(x, pattern, **kwargs):
++        if pattern.strip().startswith("b s"):
++            return x.view(-1, *x.shape[2:])
++        elif pattern.strip().startswith("(b s)"):
++            b = kwargs.get("b", x.shape[0])
++            return x.view(b, -1, *x.shape[1:])
++        return x
+ 
+ 
+ __all__ = ["DataParallelPPOActor"]
+diff --git a/verl/workers/critic/dp_critic.py b/verl/workers/critic/dp_critic.py
+index cc863c8..a6fb659 100644
+--- a/verl/workers/critic/dp_critic.py
++++ b/verl/workers/critic/dp_critic.py
+@@ -37,7 +37,31 @@ from .config import CriticConfig
+ try:
+     from flash_attn.bert_padding import index_first_axis, pad_input, rearrange, unpad_input
+ except ImportError:
+-    pass
++    import torch as _torch
++
++    def unpad_input(hidden_states, attention_mask):
++        seqlens = attention_mask.sum(dim=-1, dtype=_torch.int32)
++        indices = _torch.nonzero(attention_mask.flatten(), as_tuple=False).flatten()
++        cu_seqlens = _torch.cat([seqlens.new_zeros(1), seqlens.cumsum(0)], dim=0).to(_torch.int32)
++        max_seqlen = int(seqlens.max().item())
++        hidden_states = hidden_states.view(-1, *hidden_states.shape[2:])[indices]
++        return hidden_states, indices, cu_seqlens, max_seqlen
++
++    def pad_input(hidden_states, indices, batch, seqlen):
++        output = hidden_states.new_zeros(batch * seqlen, *hidden_states.shape[1:])
++        output[indices] = hidden_states
++        return output.view(batch, seqlen, *hidden_states.shape[1:])
++
++    def index_first_axis(x, indices):
++        return x.view(-1, *x.shape[2:])[indices]
++
++    def rearrange(x, pattern, **kwargs):
++        if pattern.strip().startswith("b s"):
++            return x.view(-1, *x.shape[2:])
++        elif pattern.strip().startswith("(b s)"):
++            b = kwargs.get("b", x.shape[0])
++            return x.view(b, -1, *x.shape[1:])
++        return x
+ 
+ 
+ __all__ = ["DataParallelPPOCritic"]
+diff --git a/verl/workers/fsdp_workers.py b/verl/workers/fsdp_workers.py
+index 68bd4ef..1d75fe0 100644
+--- a/verl/workers/fsdp_workers.py
++++ b/verl/workers/fsdp_workers.py
+@@ -37,7 +37,10 @@ from transformers import (
+     GenerationConfig,
+     PreTrainedModel,
+ )
+-from transformers.modeling_utils import no_init_weights
++try:
++    from transformers.modeling_utils import no_init_weights
++except ImportError:
++    from contextlib import nullcontext as no_init_weights
+ 
+ from ..models.monkey_patch import apply_ulysses_patch
+ from ..protocol import DataProto
+@@ -207,12 +210,18 @@ class FSDPWorker(Worker):
+         else:
+             AutoClass = AutoModelForCausalLM
+ 
++        try:
++            import flash_attn
++            attn_impl = "flash_attention_2"
++        except ImportError:
++            attn_impl = "sdpa"
++
+         if (not fsdp_config.enable_rank0_init) or self.device_mesh.get_local_rank("fsdp") == 0:
+             model = AutoClass.from_pretrained(
+                 model_config.model_path,
+                 config=self.model_config,
+                 torch_dtype=torch_dtype,
+-                attn_implementation="flash_attention_2",
++                attn_implementation=attn_impl,
+                 device_map="cpu" if fsdp_config.enable_rank0_init else "cuda",
+                 low_cpu_mem_usage=True,
+                 trust_remote_code=model_config.trust_remote_code,
+@@ -222,7 +231,7 @@ class FSDPWorker(Worker):
+                 model = AutoClass.from_config(
+                     self.model_config,
+                     torch_dtype=torch_dtype,
+-                    attn_implementation="flash_attention_2",
++                    attn_implementation=attn_impl,
+                     trust_remote_code=model_config.trust_remote_code,
+                 )
+ 
+diff --git a/verl/workers/reward/config.py b/verl/workers/reward/config.py
+index 5a8a135..ff192e7 100644
+--- a/verl/workers/reward/config.py
++++ b/verl/workers/reward/config.py
+@@ -27,6 +27,7 @@ class RewardConfig:
+     reward_function_kwargs: dict = field(default_factory=dict)
+     skip_special_tokens: bool = True
+     num_cpus: int = 1
++    num_gpus: int = 0
+     # below are auto keys
+     reward_function_name: Optional[str] = field(default=None, init=False)
+ 
+diff --git a/verl/workers/reward/function.py b/verl/workers/reward/function.py
+index 216cbec..908f98a 100644
+--- a/verl/workers/reward/function.py
++++ b/verl/workers/reward/function.py
+@@ -57,11 +57,14 @@ class SequentialFunctionRewardManagerMixin:
+             response_str = self.tokenizer.decode(
+                 valid_response_ids, skip_special_tokens=self.config.skip_special_tokens
+             )
++            last_token_id = int(valid_response_ids[-1].item()) if cur_response_length > 0 else -1
+             score = self.reward_fn(
+                 {
+                     "response": response_str,
+                     "response_length": cur_response_length,
+                     "ground_truth": data.non_tensor_batch["ground_truth"][i],
++                    "last_token_id": last_token_id,
++                    "eos_token_id": self.tokenizer.eos_token_id,
+                 }
+             )
+             reward_tensor[i, cur_response_length - 1] = score["overall"]
+@@ -84,11 +87,14 @@ class BatchFunctionRewardManagerMixin:
+             response_str = self.tokenizer.decode(
+                 valid_response_ids, skip_special_tokens=self.config.skip_special_tokens
+             )
++            last_token_id = int(valid_response_ids[-1].item()) if cur_response_length > 0 else -1
+             reward_inputs.append(
+                 {
+                     "response": response_str,
+                     "response_length": cur_response_length,
+                     "ground_truth": data.non_tensor_batch["ground_truth"][i],
++                    "last_token_id": last_token_id,
++                    "eos_token_id": self.tokenizer.eos_token_id,
+                 }
+             )
+ 
+diff --git a/verl/workers/rollout/vllm_rollout_spmd.py b/verl/workers/rollout/vllm_rollout_spmd.py
+index 4bf820c..4e49711 100644
+--- a/verl/workers/rollout/vllm_rollout_spmd.py
++++ b/verl/workers/rollout/vllm_rollout_spmd.py
+@@ -140,13 +140,11 @@ class vLLMRollout(BaseRollout):
+             enforce_eager=config.enforce_eager,
+             disable_custom_all_reduce=True,
+             enable_chunked_prefill=config.enable_chunked_prefill,
+-            enable_sleep_mode=True,
++            enable_sleep_mode=False,
+             **lora_kwargs,
+             **engine_kwargs,
+         )
+ 
+-        # Offload vllm model to reduce peak memory usage
+-        self.inference_engine.sleep(level=1)
+ 
+         sampling_kwargs = {
+             "max_tokens": config.response_length,
+diff --git a/verl/workers/sharding_manager/fsdp_vllm.py b/verl/workers/sharding_manager/fsdp_vllm.py
+index a9b5640..d01aef4 100644
+--- a/verl/workers/sharding_manager/fsdp_vllm.py
++++ b/verl/workers/sharding_manager/fsdp_vllm.py
+@@ -178,16 +178,9 @@ class FSDPVLLMShardingManager(BaseShardingManager):
+         self.loaded = True
+ 
+         print_gpu_memory_usage("Before vllm wake up in sharding manager")
+-        if "tags" in inspect.signature(self.inference_engine.wake_up).parameters:
+-            self.inference_engine.wake_up(tags=["weights"])
+-        else:
+-            self.inference_engine.wake_up()
+ 
+         self._sync_weight_to_vllm()
+ 
+-        if "tags" in inspect.signature(self.inference_engine.wake_up).parameters:
+-            self.inference_engine.wake_up(tags=["kv_cache"])
+-
+         print_gpu_memory_usage("After vllm wake up in sharding manager")
+         # important: need to manually set the random states of each tp to be identical.
+         if self.device_mesh is not None:
+@@ -200,10 +193,7 @@ class FSDPVLLMShardingManager(BaseShardingManager):
+         self.loaded = False
+ 
+         print_gpu_memory_usage("Before vllm offload in sharding manager")
+-        free_bytes_before_sleep = torch.cuda.mem_get_info()[0]
+-        self.inference_engine.sleep(level=1)
+-        free_bytes_after_sleep = torch.cuda.mem_get_info()[0]
+-        self.freed_bytes = free_bytes_after_sleep - free_bytes_before_sleep
++        self.freed_bytes = 0
+         print_gpu_memory_usage("After vllm offload in sharding manager")
+ 
+         self.module.train()

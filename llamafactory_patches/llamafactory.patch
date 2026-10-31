@@ -1,0 +1,748 @@
+diff --git a/src/llamafactory/data/collator.py b/src/llamafactory/data/collator.py
+index d1e562d9..587af2a0 100644
+--- a/src/llamafactory/data/collator.py
++++ b/src/llamafactory/data/collator.py
+@@ -108,10 +108,14 @@ class MultiModalDataCollatorForSeq2Seq(DataCollatorForSeq2Seq):
+     def __call__(self, features: list[dict[str, Any]]) -> dict[str, "torch.Tensor"]:
+         batch_images, batch_videos, batch_audios = [], [], []
+         batch_imglens, batch_vidlens, batch_audlens, batch_input_ids = [], [], [], []
++        sample_weights = []
++        per_sample_ul_labels: list[Optional[list[int]]] = []
+         for feature in features:
+             images = feature.pop("images", None) or []
+             videos = feature.pop("videos", None) or []
+             audios = feature.pop("audios", None) or []
++            sample_weights.append(feature.pop("sample_weight", 1.0))
++            per_sample_ul_labels.append(feature.pop("ul_labels", None))
+             batch_images.extend(images)
+             batch_videos.extend(videos)
+             batch_audios.extend(audios)
+@@ -182,6 +186,27 @@ class MultiModalDataCollatorForSeq2Seq(DataCollatorForSeq2Seq):
+ 
+         features: dict[str, torch.Tensor] = super().__call__(features)
+ 
++        if any(w != 1.0 for w in sample_weights):
++            features["sample_weight"] = torch.tensor(sample_weights, dtype=torch.float32)
++
++        if any(ul is not None for ul in per_sample_ul_labels):
++            padded_labels: "torch.Tensor" = features["labels"]
++            bsz, seq_len = padded_labels.shape
++            ul_tensor = torch.full((bsz, seq_len), IGNORE_INDEX, dtype=padded_labels.dtype)
++            pad_side = self.tokenizer.padding_side if self.tokenizer is not None else "right"
++            for i, ul in enumerate(per_sample_ul_labels):
++                if ul is None:
++                    continue
++                L = len(ul)
++                if L > seq_len:
++                    ul = ul[:seq_len]
++                    L = seq_len
++                if pad_side == "right":
++                    ul_tensor[i, :L] = torch.tensor(ul, dtype=padded_labels.dtype)
++                else:
++                    ul_tensor[i, seq_len - L:] = torch.tensor(ul, dtype=padded_labels.dtype)
++            features["ul_labels"] = ul_tensor
++
+         if self.get_rope_func is not None:
+             rope_index_kwargs = {
+                 "input_ids": features["input_ids"],
+diff --git a/src/llamafactory/data/converter.py b/src/llamafactory/data/converter.py
+index 7ec6f12b..f5daa855 100644
+--- a/src/llamafactory/data/converter.py
++++ b/src/llamafactory/data/converter.py
+@@ -127,6 +127,10 @@ class AlpacaDatasetConverter(DatasetConverter):
+             "_images": self._find_medias(example[self.dataset_attr.images]) if self.dataset_attr.images else None,
+             "_videos": self._find_medias(example[self.dataset_attr.videos]) if self.dataset_attr.videos else None,
+             "_audios": self._find_medias(example[self.dataset_attr.audios]) if self.dataset_attr.audios else None,
++            "_sample_weight": example.get("sample_weight", None),
++            "_span_wrong_text": example.get("span_wrong_text", None),
++            "_span_correct_text": example.get("span_correct_text", None),
++            "_ul_wrong_prefix": example.get("ul_wrong_prefix", None),
+         }
+         return output
+ 
+@@ -223,6 +227,10 @@ class SharegptDatasetConverter(DatasetConverter):
+             "_images": self._find_medias(example[self.dataset_attr.images]) if self.dataset_attr.images else None,
+             "_videos": self._find_medias(example[self.dataset_attr.videos]) if self.dataset_attr.videos else None,
+             "_audios": self._find_medias(example[self.dataset_attr.audios]) if self.dataset_attr.audios else None,
++            "_sample_weight": example.get("sample_weight", None),
++            "_span_wrong_text": example.get("span_wrong_text", None),
++            "_span_correct_text": example.get("span_correct_text", None),
++            "_ul_wrong_prefix": example.get("ul_wrong_prefix", None),
+         }
+         return output
+ 
+@@ -363,6 +371,7 @@ class OpenAIDatasetConverter(DatasetConverter):
+             "_images": self._find_medias(example[self.dataset_attr.images]) if self.dataset_attr.images else None,
+             "_videos": self._find_medias(example[self.dataset_attr.videos]) if self.dataset_attr.videos else None,
+             "_audios": self._find_medias(example[self.dataset_attr.audios]) if self.dataset_attr.audios else None,
++            "_sample_weight": example.get("sample_weight", None),
+         }
+         return output
+ 
+diff --git a/src/llamafactory/data/mm_plugin.py b/src/llamafactory/data/mm_plugin.py
+index fca092cb..be43b94b 100644
+--- a/src/llamafactory/data/mm_plugin.py
++++ b/src/llamafactory/data/mm_plugin.py
+@@ -26,7 +26,10 @@ from typing import TYPE_CHECKING, BinaryIO, Literal, NotRequired, Optional, Type
+ 
+ import numpy as np
+ import torch
+-import torchaudio
++try:
++    import torchaudio
++except Exception:
++    torchaudio = None
+ from transformers.image_utils import get_image_size, is_valid_image, to_numpy_array
+ from transformers.models.mllama.processing_mllama import (
+     convert_sparse_cross_attention_mask_to_dense,
+diff --git a/src/llamafactory/data/processor/supervised.py b/src/llamafactory/data/processor/supervised.py
+index b5aba11b..0b694355 100644
+--- a/src/llamafactory/data/processor/supervised.py
++++ b/src/llamafactory/data/processor/supervised.py
+@@ -25,7 +25,89 @@ if TYPE_CHECKING:
+     from ..mm_plugin import AudioInput, ImageInput, VideoInput
+ 
+ 
+-logger = logging.get_logger(__name__)
++def _apply_span_mask(
++    input_ids: list[int],
++    labels: list[int],
++    wrong_text: str,
++    correct_text: str,
++    tokenizer,
++) -> list[int]:
++    import re, string as _string
++
++    def norm(s):
++        s = s.lower()
++        s = re.sub(f"[{re.escape(_string.punctuation)}]", " ", s)
++        return " ".join(s.split())
++
++    resp_positions = [i for i, l in enumerate(labels) if l != IGNORE_INDEX]
++    if not resp_positions:
++        return labels
++
++    resp_ids = [input_ids[p] for p in resp_positions]
++    resp_text = tokenizer.decode(resp_ids, skip_special_tokens=True)
++
++    ct_norm = norm(correct_text)
++    rt_norm = norm(resp_text)
++    if ct_norm not in rt_norm:
++        return labels
++
++    char_start = rt_norm.index(ct_norm)
++    char_end = char_start + len(ct_norm)
++
++    cumulative = ""
++    tok_start = None
++    tok_end = None
++    for i, rid in enumerate(resp_ids):
++        tok_str = tokenizer.decode([rid], skip_special_tokens=False)
++        prev_len = len(norm(cumulative))
++        cumulative += tok_str
++        curr_len = len(norm(cumulative))
++        if tok_start is None and curr_len > char_start:
++            tok_start = i
++        if tok_start is not None and curr_len >= char_end:
++            tok_end = i + 1
++            break
++
++    if tok_start is None or tok_end is None:
++        return labels
++
++    new_labels = list(labels)
++    for i, p in enumerate(resp_positions):
++        if i < tok_start or i >= tok_end:
++            new_labels[p] = IGNORE_INDEX
++
++    return new_labels
++
++
++def _build_ul_labels(
++    input_ids: list[int],
++    labels: list[int],
++    ul_wrong_prefix: str,
++    tokenizer,
++) -> tuple[list[int], list[int]]:
++    resp_positions = [i for i, l in enumerate(labels) if l != IGNORE_INDEX]
++    if not resp_positions:
++        return labels, [IGNORE_INDEX] * len(labels)
++
++    target_char_len = len(ul_wrong_prefix)
++    cumulative = ""
++    target_pos = None
++    for p in resp_positions:
++        tok_str = tokenizer.decode([input_ids[p]], skip_special_tokens=False)
++        prev_len = len(cumulative)
++        cumulative += tok_str
++        if len(cumulative) > target_char_len:
++            target_pos = p
++            break
++
++    ul_labels = [IGNORE_INDEX] * len(labels)
++    new_labels = [IGNORE_INDEX] * len(labels)
++    if target_pos is not None:
++        ul_labels[target_pos] = input_ids[target_pos]
++    return new_labels, ul_labels
++
++
++
+ 
+ 
+ @dataclass
+@@ -107,10 +189,31 @@ class SupervisedDatasetProcessor(DatasetProcessor):
+             )
+             model_inputs["input_ids"].append(input_ids)
+             model_inputs["attention_mask"].append([1] * len(input_ids))
++
++            wrong_text = examples.get("_span_wrong_text", [None] * len(examples["_prompt"]))[i]
++            correct_text = examples.get("_span_correct_text", [None] * len(examples["_prompt"]))[i]
++            if wrong_text and correct_text:
++                labels = _apply_span_mask(
++                    input_ids, labels, wrong_text, correct_text, self.tokenizer
++                )
++
++            ul_prefix = examples.get("_ul_wrong_prefix", [None] * len(examples["_prompt"]))[i]
++            if ul_prefix is not None:
++                labels, ul_labels = _build_ul_labels(
++                    input_ids, labels, ul_prefix, self.tokenizer
++                )
++            else:
++                ul_labels = [IGNORE_INDEX] * len(labels)
++
+             model_inputs["labels"].append(labels)
++            model_inputs["ul_labels"].append(ul_labels)
+             model_inputs["images"].append(examples["_images"][i])
+             model_inputs["videos"].append(examples["_videos"][i])
+             model_inputs["audios"].append(examples["_audios"][i])
++            if "_sample_weight" in examples and examples["_sample_weight"][i] is not None:
++                model_inputs["sample_weight"].append(float(examples["_sample_weight"][i]))
++            else:
++                model_inputs["sample_weight"].append(1.0)
+ 
+         return model_inputs
+ 
+diff --git a/src/llamafactory/hparams/finetuning_args.py b/src/llamafactory/hparams/finetuning_args.py
+index 053b4ab6..3aa982d5 100644
+--- a/src/llamafactory/hparams/finetuning_args.py
++++ b/src/llamafactory/hparams/finetuning_args.py
+@@ -30,6 +30,16 @@ class FreezeArguments:
+             )
+         },
+     )
++    freeze_trainable_layer_ids: str | None = field(
++        default=None,
++        metadata={
++            "help": (
++                "Comma-separated list of layer indices to set as trainable for freeze fine-tuning. "
++                "If set, overrides freeze_trainable_layers. "
++                "Example: '0,1,2,3,4,5,6' trains only layers 0-6."
++            )
++        },
++    )
+     freeze_trainable_modules: str = field(
+         default="all",
+         metadata={
+@@ -88,6 +98,16 @@ class LoraArguments:
+             )
+         },
+     )
++    lora_layers_to_transform: list[int] | None = field(
++        default=None,
++        metadata={
++            "help": (
++                "List of transformer layer indices to apply LoRA to. "
++                "If None (default), LoRA is applied to every layer (peft default). "
++                "Example: [0,1,2,...,17] restricts LoRA to layers 0-17 of the backbone."
++            )
++        },
++    )
+     loraplus_lr_ratio: float | None = field(
+         default=None,
+         metadata={"help": "LoRA plus learning rate ratio (lr_B / lr_A)."},
+@@ -506,6 +526,60 @@ class FinetuningArguments(
+         default=1.0,
+         metadata={"help": "The alpha parameter for EAFT loss to control the power of adaptive weight."},
+     )
++    use_targeted_loss: bool = field(
++        default=False,
++        metadata={"help": "Whether to use the targeted loss for knowledge injection (from exp12)."},
++    )
++    targeted_lambda_anchor: float = field(
++        default=10.0,
++        metadata={"help": "Lambda for anchor KL on answer positions (excluding A/B tokens) in targeted loss."},
++    )
++    targeted_lambda_other: float = field(
++        default=100.0,
++        metadata={"help": "Lambda for KL on non-answer positions in targeted loss."},
++    )
++    targeted_lambda_replay: float = field(
++        default=100.0,
++        metadata={"help": "Lambda for FineWeb-Edu replay KL loss in targeted loss."},
++    )
++    targeted_replay_n_samples: int = field(
++        default=50,
++        metadata={"help": "Number of FineWeb-Edu samples to cache for replay."},
++    )
++    targeted_replay_max_len: int = field(
++        default=512,
++        metadata={"help": "Max token length for replay samples."},
++    )
++    targeted_replay_n_per_step: int = field(
++        default=5,
++        metadata={"help": "Number of replay samples used per training step."},
++    )
++    use_l2_reg: bool = field(
++        default=False,
++        metadata={"help": "Whether to use L2 parameter regularization (θ − θ_base)² to constrain model drift."},
++    )
++    l2_lambda: float = field(
++        default=1e-5,
++        metadata={"help": "Lambda for L2 regularization. Gradient injection: param.grad += 2λ(θ − θ_base)."},
++    )
++    l2_base_model: str | None = field(
++        default=None,
++        metadata={"help": "Path to the base model for L2 regularization reference parameters."},
++    )
++    use_sample_weight: bool = field(
++        default=False,
++        metadata={"help": "Whether to use per-sample loss weights from dataset for class balancing."},
++    )
++    use_unlikelihood: bool = field(
++        default=False,
++        metadata={"help": "Welleck unlikelihood form B: wrong samples get -log(1-p) "
++                          "at first-wrong-token only; correct samples get normal CE. "
++                          "Requires ul_wrong_prefix field in training examples."},
++    )
++    unlikelihood_alpha: float = field(
++        default=1.0,
++        metadata={"help": "Scalar multiplier on the unlikelihood loss term."},
++    )
+     freeze_vision_tower: bool = field(
+         default=True,
+         metadata={"help": "Whether ot not to freeze the vision tower in MLLM training."},
+@@ -547,6 +621,10 @@ class FinetuningArguments(
+ 
+         self.freeze_trainable_modules: list[str] = split_arg(self.freeze_trainable_modules)
+         self.freeze_extra_modules: list[str] | None = split_arg(self.freeze_extra_modules)
++        if self.freeze_trainable_layer_ids is not None:
++            self.freeze_trainable_layer_ids: list[int] | None = [
++                int(x.strip()) for x in self.freeze_trainable_layer_ids.split(",") if x.strip()
++            ]
+         self.lora_alpha: int = self.lora_alpha or self.lora_rank * 2
+         self.lora_target: list[str] = split_arg(self.lora_target)
+         self.oft_target: list[str] = split_arg(self.oft_target)
+diff --git a/src/llamafactory/model/adapter.py b/src/llamafactory/model/adapter.py
+index 708db942..0e155590 100644
+--- a/src/llamafactory/model/adapter.py
++++ b/src/llamafactory/model/adapter.py
+@@ -79,7 +79,10 @@ def _setup_freeze_tuning(
+     if not num_layers:
+         raise ValueError("Current model does not support freeze tuning.")
+ 
+-    if finetuning_args.use_llama_pro:
++    if finetuning_args.freeze_trainable_layer_ids is not None:
++        trainable_layer_ids = [idx for idx in finetuning_args.freeze_trainable_layer_ids if 0 <= idx < num_layers]
++        logger.info_rank0("Using explicit trainable layer ids: {}".format(trainable_layer_ids))
++    elif finetuning_args.use_llama_pro:
+         if num_layers % finetuning_args.freeze_trainable_layers != 0:
+             raise ValueError(
+                 f"`num_layers` {num_layers} should be "
+@@ -260,6 +263,8 @@ def _setup_lora_tuning(
+                 "use_dora": finetuning_args.use_dora,
+                 "modules_to_save": finetuning_args.additional_target,
+             }
++            if finetuning_args.lora_layers_to_transform is not None:
++                peft_kwargs["layers_to_transform"] = list(finetuning_args.lora_layers_to_transform)
+         elif finetuning_args.finetuning_type == "oft":
+             peft_kwargs = {
+                 "r": finetuning_args.oft_rank,
+diff --git a/src/llamafactory/train/sft/trainer.py b/src/llamafactory/train/sft/trainer.py
+index 7726b395..0d6e5698 100644
+--- a/src/llamafactory/train/sft/trainer.py
++++ b/src/llamafactory/train/sft/trainer.py
+@@ -54,6 +54,8 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
+         model_args: Optional["ModelArguments"] = None,
+         gen_kwargs: Optional[dict[str, Any]] = None,
+         ref_model: Optional["torch.nn.Module"] = None,
++        replay_input_ids: Optional[list] = None,
++        replay_ref_logits: Optional[list] = None,
+         **kwargs,
+     ) -> None:
+         kwargs["processing_class"] = kwargs.pop("tokenizer")
+@@ -84,7 +86,18 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
+             self.accelerator.clip_grad_norm_ = MethodType(clip_grad_norm_old_version, self.accelerator)
+             self.add_callback(BAdamCallback)
+ 
++        fisher_mask_file = os.environ.get("FISHER_MASK_PARAMS_FILE", "")
++        if fisher_mask_file and os.path.isfile(fisher_mask_file):
++            import sys
++            sys.path.insert(0, os.path.dirname(fisher_mask_file))
++            from fisher_gradient_mask import FisherMaskCallback
++            self.add_callback(FisherMaskCallback.from_file(fisher_mask_file))
++            logger.info_rank0(f"FisherMaskCallback registered from: {fisher_mask_file}")
++
+         self.ref_model = ref_model
++        self.replay_input_ids = replay_input_ids or []
++        self.replay_ref_logits = replay_ref_logits or []
++        self._replay_idx = 0
+ 
+         if ref_model is not None:
+             from trl.models.utils import prepare_deepspeed, prepare_fsdp
+@@ -123,6 +136,25 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
+                 asft_loss_func,
+                 asft_alpha=finetuning_args.asft_alpha,
+             )
++        elif finetuning_args.use_targeted_loss:
++            pass
++
++        self.l2_base_params: dict[str, torch.Tensor] = {}
++        self.l2_lambda: float = 0.0
++        if finetuning_args.use_l2_reg:
++            if finetuning_args.l2_base_model is None:
++                raise ValueError("l2_base_model must be specified when use_l2_reg is True")
++            self.l2_lambda = finetuning_args.l2_lambda
++            logger.info_rank0(f"Loading base model params for L2 reg (lambda={self.l2_lambda}) from {finetuning_args.l2_base_model}")
++            from transformers import AutoModelForCausalLM
++            base_model_tmp = AutoModelForCausalLM.from_pretrained(
++                finetuning_args.l2_base_model, torch_dtype=torch.bfloat16, trust_remote_code=True,
++                device_map="cpu",
++            )
++            self.l2_base_params = {name: param.detach().cpu().clone() for name, param in base_model_tmp.named_parameters()}
++            del base_model_tmp
++            import gc; gc.collect()
++            logger.info_rank0(f"Loaded {len(self.l2_base_params)} parameter tensors for L2 reg.")
+ 
+         if training_args.fp8 and hasattr(self, "accelerator"):  # verify FP8 status after trainer initialization
+             verify_fp8_status(self.accelerator, training_args)
+@@ -149,6 +181,9 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
+ 
+     @override
+     def compute_loss(self, model, inputs, *args, **kwargs):
++        sample_weights = inputs.pop("sample_weight", None)
++        ul_labels = inputs.pop("ul_labels", None)
++
+         if self.finetuning_args.use_asft_loss:
+             with torch.no_grad():
+                 ref_outputs = self.ref_model(
+@@ -158,8 +193,128 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
+                 ref_logits = ref_outputs.logits
+             outputs = model(**inputs)
+             return self.compute_loss_func(outputs, inputs["labels"], ref_logits)
++        elif self.finetuning_args.use_targeted_loss:
++            from ..trainer_utils import targeted_loss_func
++            with torch.no_grad():
++                ref_outputs = self.ref_model(
++                    input_ids=inputs["input_ids"],
++                    attention_mask=inputs.get("attention_mask", None),
++                )
++                ref_logits = ref_outputs.logits
++            outputs = model(**inputs)
++            n_replay = self.finetuning_args.targeted_replay_n_per_step
++            step_replay_ids = []
++            step_replay_ref = []
++            if self.replay_input_ids and n_replay > 0:
++                for _ in range(n_replay):
++                    idx = self._replay_idx % len(self.replay_input_ids)
++                    self._replay_idx += 1
++                    step_replay_ids.append(self.replay_input_ids[idx])
++                    step_replay_ref.append(self.replay_ref_logits[idx])
++            return targeted_loss_func(
++                outputs, inputs["labels"], ref_logits,
++                lambda_anchor=self.finetuning_args.targeted_lambda_anchor,
++                lambda_other=self.finetuning_args.targeted_lambda_other,
++                replay_input_ids=step_replay_ids if step_replay_ids else None,
++                replay_ref_logits=step_replay_ref if step_replay_ref else None,
++                lambda_replay=self.finetuning_args.targeted_lambda_replay,
++                model=model,
++            )
++        elif self.finetuning_args.use_unlikelihood and ul_labels is not None:
++            outputs = model(**inputs)
++            logits = outputs.logits
++            labels = inputs["labels"]
++
++            shift_logits = logits[..., :-1, :].contiguous()
++            shift_labels = labels[..., 1:].contiguous()
++            shift_ul = ul_labels[..., 1:].contiguous().to(shift_logits.device)
++
++            loss_fct = torch.nn.CrossEntropyLoss(reduction="sum", ignore_index=IGNORE_INDEX)
++            ce_sum = loss_fct(
++                shift_logits.view(-1, shift_logits.size(-1)),
++                shift_labels.view(-1),
++            )
++            ce_count = (shift_labels != IGNORE_INDEX).sum().clamp(min=1)
++
++            ul_mask = (shift_ul != IGNORE_INDEX)
++            if ul_mask.any():
++                ul_positions = ul_mask.nonzero(as_tuple=False)
++                ul_logits_sel = shift_logits[ul_positions[:, 0], ul_positions[:, 1]]
++                ul_tok_ids = shift_ul[ul_positions[:, 0], ul_positions[:, 1]]
++                ul_probs = torch.softmax(ul_logits_sel, dim=-1)
++                p_wrong = ul_probs.gather(-1, ul_tok_ids.unsqueeze(-1)).squeeze(-1)
++                one_minus_p = (1.0 - p_wrong).clamp(min=1e-8)
++                ul_sum = -torch.log(one_minus_p).sum()
++                ul_count = p_wrong.numel()
++            else:
++                ul_sum = torch.zeros((), device=logits.device, dtype=logits.dtype)
++                ul_count = 0
++
++            alpha = float(self.finetuning_args.unlikelihood_alpha)
++            total_sum = ce_sum + alpha * ul_sum
++            total_count = ce_count + ul_count
++            ce_loss = total_sum / total_count
++
++            if self.state.global_step % 20 == 0:
++                logger.info_rank0(
++                    f"step={self.state.global_step} "
++                    f"ce_sum={ce_sum.item():.4f} ce_n={int(ce_count.item())} "
++                    f"ul_sum={float(ul_sum.item() if torch.is_tensor(ul_sum) else ul_sum):.4f} "
++                    f"ul_n={int(ul_count)} alpha={alpha} loss={ce_loss.item():.4f}"
++                )
++
++        elif sample_weights is not None and self.finetuning_args.use_sample_weight:
++            outputs = model(**inputs)
++            logits = outputs.logits
++            labels = inputs["labels"]
++
++            shift_logits = logits[..., :-1, :].contiguous()
++            shift_labels = labels[..., 1:].contiguous()
++
++            loss_fct = torch.nn.CrossEntropyLoss(reduction="none", ignore_index=IGNORE_INDEX)
++            per_token_loss = loss_fct(
++                shift_logits.view(-1, shift_logits.size(-1)),
++                shift_labels.view(-1),
++            )
++            per_token_loss = per_token_loss.view(shift_labels.size())
++
++            mask = (shift_labels != IGNORE_INDEX).float()
++            per_sample_loss = (per_token_loss * mask).sum(dim=-1) / mask.sum(dim=-1).clamp(min=1)
++
++            sample_weights = sample_weights.to(per_sample_loss.device)
++            weighted_loss = (per_sample_loss * sample_weights).sum() / sample_weights.sum()
++
++            return weighted_loss
+         else:
+-            return super().compute_loss(model, inputs, *args, **kwargs)
++            ce_loss = super().compute_loss(model, inputs, *args, **kwargs)
++
++        if self.l2_base_params:
++            l2_val = torch.tensor(0.0, device=ce_loss.device)
++            n_params = 0
++            for name, param in model.named_parameters():
++                if not param.requires_grad:
++                    continue
++                key = name[len("module."):] if name.startswith("module.") else name
++                if key in self.l2_base_params:
++                    base = self.l2_base_params[key].to(param.device, dtype=param.dtype)
++                    l2_val = l2_val + ((param - base) ** 2).sum()
++                    n_params += 1
++            l2_loss = self.l2_lambda * l2_val
++
++            if self.state.global_step % 20 == 0:
++                logger.info_rank0(
++                    f"step={self.state.global_step} ce={ce_loss.item():.4f} "
++                    f"l2={l2_val.item():.4f} l2_scaled={l2_loss.item():.2e} params={n_params}"
++                )
++
++            return ce_loss + l2_loss
++
++        return ce_loss
++
++    @override
++    def training_step(self, model, inputs, *args, **kwargs):
++        result = super().training_step(model, inputs, *args, **kwargs)
++        return result
+ 
+     @override
+     def prediction_step(
+diff --git a/src/llamafactory/train/sft/workflow.py b/src/llamafactory/train/sft/workflow.py
+index db625028..fd61742c 100644
+--- a/src/llamafactory/train/sft/workflow.py
++++ b/src/llamafactory/train/sft/workflow.py
+@@ -17,6 +17,9 @@
+ 
+ from typing import TYPE_CHECKING, Optional
+ 
++import random
++import torch
++
+ from ...data import SFTDataCollatorWith4DAttentionMask, get_dataset, get_template_and_fix_tokenizer
+ from ...extras.constants import IGNORE_INDEX
+ from ...extras.logging import get_logger
+@@ -53,9 +56,44 @@ def run_sft(
+     model = load_model(tokenizer, model_args, finetuning_args, training_args.do_train)
+ 
+     ref_model = None
+-    if finetuning_args.use_asft_loss:
++    if finetuning_args.use_asft_loss or finetuning_args.use_targeted_loss:
+         ref_model = create_ref_model(model_args, finetuning_args)
+ 
++    replay_input_ids = []
++    replay_ref_logits = []
++    if finetuning_args.use_targeted_loss and finetuning_args.targeted_lambda_replay > 0:
++        try:
++            import pandas as pd
++            FINEWEB_PARQUET = (
++                "/path/to/hf_cache/hub/datasets--HuggingFaceFW--fineweb-edu"
++                "/snapshots/commit-1991e091b53/sample/10BT/000_00000.parquet"
++            )
++            n_samples = finetuning_args.targeted_replay_n_samples
++            max_len = finetuning_args.targeted_replay_max_len
++            logger.info_rank0(f"Loading {n_samples} FineWeb-Edu replay samples (max_len={max_len})...")
++            rng = random.Random(42)
++            df = pd.read_parquet(FINEWEB_PARQUET, columns=["text"])
++            indices = rng.sample(range(len(df)), min(n_samples, len(df)))
++            raw_replay = []
++            for idx in indices:
++                text = df.iloc[idx]["text"]
++                ids = tokenizer.encode(text, add_special_tokens=False)
++                if len(ids) > max_len:
++                    ids = ids[:max_len]
++                if len(ids) < 16:
++                    continue
++                raw_replay.append(torch.tensor(ids))
++            device = next(ref_model.parameters()).device
++            ref_model.eval()
++            for r_ids in raw_replay:
++                with torch.no_grad():
++                    r_logits = ref_model(r_ids.unsqueeze(0).to(device)).logits[0].cpu().half()
++                replay_input_ids.append(r_ids)
++                replay_ref_logits.append(r_logits)
++            logger.info_rank0(f"Cached replay logits for {len(replay_input_ids)} FineWeb-Edu samples.")
++        except Exception as e:
++            logger.warning_rank0(f"Failed to load FineWeb-Edu replay data: {e}. Replay disabled.")
++
+     if getattr(model, "is_quantized", False) and not training_args.do_train:
+         setattr(model, "_hf_peft_config_loaded", True)  # hack here: make model compatible with prediction
+ 
+@@ -129,6 +167,8 @@ def run_sft(
+             callbacks=callbacks,
+             gen_kwargs=gen_kwargs,
+             ref_model=ref_model,
++            replay_input_ids=replay_input_ids if replay_input_ids else None,
++            replay_ref_logits=replay_ref_logits if replay_ref_logits else None,
+             **dataset_module,
+             **tokenizer_module,
+             **metric_module,
+diff --git a/src/llamafactory/train/trainer_utils.py b/src/llamafactory/train/trainer_utils.py
+index 5f927dde..f4748fa7 100644
+--- a/src/llamafactory/train/trainer_utils.py
++++ b/src/llamafactory/train/trainer_utils.py
+@@ -825,6 +825,117 @@ def _eaft_cross_entropy(
+     return loss
+ 
+ 
++def targeted_loss_func(
++    outputs,
++    labels: torch.Tensor,
++    ref_logits: torch.Tensor,
++    lambda_anchor: float = 10.0,
++    lambda_other: float = 100.0,
++    ignore_index: int = -100,
++    replay_input_ids: Optional[list] = None,
++    replay_ref_logits: Optional[list] = None,
++    lambda_replay: float = 100.0,
++    model: Optional[Any] = None,
++) -> torch.Tensor:
++    logits = outputs.get("logits")
++    if logits is None:
++        return outputs.get("loss", torch.tensor(0.0))
++
++    logits = logits.float()
++
++    shift_logits = logits[..., :-1, :].contiguous()
++    shift_labels = labels[..., 1:].contiguous()
++    shift_ref_logits = ref_logits[..., :-1, :].contiguous().float()
++
++    batch_size, seq_len, vocab_size = shift_logits.shape
++    device = shift_logits.device
++
++    total_transfer = torch.tensor(0.0, device=device)
++    total_anchor = torch.tensor(0.0, device=device)
++    total_other = torch.tensor(0.0, device=device)
++    n_answer_tokens = 0
++    n_samples_with_answers = 0
++
++    for b in range(batch_size):
++        answer_mask = shift_labels[b] != ignore_index
++        answer_positions = answer_mask.nonzero(as_tuple=True)[0]
++
++        if len(answer_positions) == 0:
++            continue
++
++        n_samples_with_answers += 1
++
++        transfer_losses = []
++        dynamic_B_ids = []
++        for pos in answer_positions:
++            correct_id = shift_labels[b, pos].item()
++            cur_logits = shift_logits[b, pos]
++
++            with torch.no_grad():
++                temp = cur_logits.detach().clone()
++                temp[correct_id] = -float('inf')
++                b_id = temp.argmax().item()
++            dynamic_B_ids.append(b_id)
++
++            z_A = cur_logits[correct_id]
++            z_B = cur_logits[b_id]
++            transfer_losses.append(F.softplus(z_B - z_A))
++
++        l_transfer = torch.stack(transfer_losses).mean()
++        total_transfer = total_transfer + l_transfer
++        n_answer_tokens += len(answer_positions)
++
++        anchor_losses = []
++        for idx, pos in enumerate(answer_positions):
++            correct_id = shift_labels[b, pos].item()
++            b_id = dynamic_B_ids[idx]
++
++            cur_logits_pos = shift_logits[b, pos]
++            ref_logits_pos = shift_ref_logits[b, pos]
++
++            mask = torch.ones(vocab_size, dtype=torch.bool, device=device)
++            mask[correct_id] = False
++            mask[b_id] = False
++
++            log_p_new = F.log_softmax(cur_logits_pos[mask], dim=-1)
++            p_old = F.softmax(ref_logits_pos[mask], dim=-1)
++            anchor_losses.append(F.kl_div(log_p_new, p_old, reduction='sum'))
++
++        l_anchor = torch.stack(anchor_losses).mean()
++        total_anchor = total_anchor + l_anchor
++
++        non_answer_mask = ~answer_mask
++        non_answer_positions = non_answer_mask.nonzero(as_tuple=True)[0]
++
++        if len(non_answer_positions) > 0:
++            log_p_new = F.log_softmax(shift_logits[b, non_answer_positions], dim=-1)
++            p_old = F.softmax(shift_ref_logits[b, non_answer_positions], dim=-1)
++            l_other = F.kl_div(log_p_new, p_old, reduction='batchmean')
++        else:
++            l_other = torch.tensor(0.0, device=device)
++
++        total_other = total_other + l_other
++
++    if n_samples_with_answers == 0:
++        return torch.tensor(0.0, device=device, requires_grad=True)
++
++    loss = (total_transfer + lambda_anchor * total_anchor + lambda_other * total_other) / n_samples_with_answers
++
++    if replay_input_ids is not None and replay_ref_logits is not None and model is not None and len(replay_input_ids) > 0:
++        replay_kl_losses = []
++        for r_ids, r_ref_logits in zip(replay_input_ids, replay_ref_logits):
++            r_input = r_ids.unsqueeze(0).to(device)
++            r_logits = model(r_input).logits[0].float()
++            log_p_new = F.log_softmax(r_logits, dim=-1)
++            p_old = F.softmax(r_ref_logits.to(device).float(), dim=-1)
++            kl = F.kl_div(log_p_new, p_old, reduction='batchmean')
++            replay_kl_losses.append(kl)
++        l_replay = torch.stack(replay_kl_losses).mean()
++        loss = loss + lambda_replay * l_replay
++
++    return loss
++
++
+ def nested_detach(
+     tensors: Union["torch.Tensor", list["torch.Tensor"], tuple["torch.Tensor"], dict[str, "torch.Tensor"]],
+     clone: bool = False,
